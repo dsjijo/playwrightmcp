@@ -22,7 +22,7 @@ let mcpExited = false;
 
 const proxy = httpProxy.createProxyServer({
   target: MCP_BASE_URL,
-  changeOrigin: false,
+  changeOrigin: true,
   ws: true,
   xfwd: true,
 });
@@ -46,6 +46,8 @@ const mcpArgs = [
   String(INTERNAL_MCP_PORT),
   '--host',
   MCP_HOST,
+  '--allowed-hosts',
+  '*',
 ];
 
 if (process.env.PLAYWRIGHT_ALLOWED_ORIGINS) {
