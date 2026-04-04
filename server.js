@@ -230,7 +230,6 @@ function proxyHttpToMcp(req, res, rawBody = null) {
     (upstreamRes) => {
       const contentType = String(upstreamRes.headers['content-type'] || '');
       const isEventStream =
-        req.method === 'GET' &&
         String(req.originalUrl || req.url || '').startsWith('/mcp') &&
         contentType.includes('text/event-stream');
 
