@@ -1,9 +1,13 @@
 // server.js
 import express from 'express';
+import http from 'node:http';
 import httpProxy from 'http-proxy';
 import { spawn } from 'node:child_process';
 
 const app = express();
+
+app.disable('etag');
+app.set('x-powered-by', false);
 
 const PUBLIC_PORT = Number(process.env.PORT || 10000);
 const INTERNAL_MCP_PORT = Number(process.env.INTERNAL_MCP_PORT || 8931);
@@ -20,7 +24,11 @@ if (!API_KEY) {
 let mcpReady = false;
 let mcpExited = false;
 
-const proxy = httpProxy.createProxyServer({
+/**
+ * WS proxy only.
+ * HTTP proxying is handled manually below to preserve streamable HTTP behavior.
+ */
+const wsProxy = httpProxy.createProxyServer({
   target: MCP_BASE_URL,
   changeOrigin: true,
   ws: true,
@@ -29,23 +37,16 @@ const proxy = httpProxy.createProxyServer({
   timeout: 0,
 });
 
-proxy.on('error', (err, req, res) => {
-  console.error('Proxy error:', err);
+wsProxy.on('error', (err, req, socketOrRes) => {
+  console.error('WS proxy error:', err);
 
-  if (res && !res.headersSent) {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-  }
-
-  if (res) {
-    res.end(JSON.stringify({ error: 'upstream_mcp_unavailable' }));
-  }
-});
-
-// Important: re-send raw body for proxied POST requests after express.raw() consumes it
-proxy.on('proxyReq', (proxyReq, req) => {
-  if (req.method === 'POST' && req.rawBody) {
-    proxyReq.setHeader('Content-Length', Buffer.byteLength(req.rawBody));
-    proxyReq.write(req.rawBody);
+  if (socketOrRes?.writable) {
+    try {
+      socketOrRes.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    } catch {}
+    try {
+      socketOrRes.destroy();
+    } catch {}
   }
 });
 
@@ -107,7 +108,7 @@ mcp.stdout.on('data', (chunk) => {
 mcp.stderr.on('data', (chunk) => {
   const text = chunk.toString();
   process.stderr.write(`[mcp] ${text}`);
-  if (text.toLowerCase().includes('listening') || text.includes('/mcp')) {
+  if (text.includes('/mcp') || text.toLowerCase().includes('listening')) {
     mcpReady = true;
   }
 });
@@ -134,40 +135,40 @@ function authorized(req) {
   return false;
 }
 
-app.get('/healthz', (_req, res) => {
-  const status = !mcpExited && mcpReady ? 200 : 503;
-  res.status(status).json({
-    ok: status === 200,
-    mcpReady,
-    mcpExited,
-  });
-});
+function copyUpstreamHeaders(req, bodyLength = null) {
+  const headers = {};
 
-app.use((req, res, next) => {
-  if (req.path === '/healthz') return next();
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lower = key.toLowerCase();
 
-  if (!authorized(req)) {
-    return res.status(401).json({ error: 'unauthorized' });
+    if (
+      lower === 'host' ||
+      lower === 'content-length' ||
+      lower === 'authorization' ||
+      lower === 'x-api-key'
+    ) {
+      continue;
+    }
+
+    if (value !== undefined) {
+      headers[key] = value;
+    }
   }
 
-  return next();
-});
+  if (bodyLength !== null) {
+    headers['content-length'] = String(bodyLength);
+  }
 
-/**
- * MCP prompt compatibility shim:
- * Some MCP clients/frameworks call prompts/list during setup.
- * Playwright MCP may not implement that method.
- * We return a valid empty prompt list so the client can continue.
- */
-const PROMPT_LIST_METHODS = new Set([
-  'prompts/list',
-  'list_prompts',
-]);
+  return headers;
+}
 
-const PROMPT_GET_METHODS = new Set([
-  'prompts/get',
-  'get_prompt',
-]);
+function writeJson(res, status, payload) {
+  const body = Buffer.from(JSON.stringify(payload));
+  res.status(status);
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Length', String(body.length));
+  res.end(body);
+}
 
 function buildJsonRpcSuccess(id, result) {
   return {
@@ -188,13 +189,21 @@ function buildJsonRpcError(id, code, message) {
   };
 }
 
+const PROMPT_LIST_METHODS = new Set([
+  'prompts/list',
+  'list_prompts',
+]);
+
+const PROMPT_GET_METHODS = new Set([
+  'prompts/get',
+  'get_prompt',
+]);
+
 function getShimmedResponse(message) {
   const method = message?.method;
 
   if (PROMPT_LIST_METHODS.has(method)) {
-    return buildJsonRpcSuccess(message.id ?? null, {
-      prompts: [],
-    });
+    return buildJsonRpcSuccess(message.id ?? null, { prompts: [] });
   }
 
   if (PROMPT_GET_METHODS.has(method)) {
@@ -204,56 +213,158 @@ function getShimmedResponse(message) {
   return null;
 }
 
-/**
- * Only intercept POST /mcp for prompt shim.
- * For non-shimmed requests, proxy them directly so streamable HTTP remains intact.
- */
-app.post('/mcp', express.raw({ type: '*/*', limit: '5mb' }), async (req, res) => {
+function proxyHttpToMcp(req, res, rawBody = null) {
+  const headers = copyUpstreamHeaders(req, rawBody ? rawBody.length : null);
+
+  const upstreamReq = http.request(
+    {
+      hostname: MCP_HOST,
+      port: INTERNAL_MCP_PORT,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      headers,
+    },
+    (upstreamRes) => {
+      res.status(upstreamRes.statusCode || 502);
+
+      for (const [key, value] of Object.entries(upstreamRes.headers)) {
+        if (key.toLowerCase() === 'connection') continue;
+        if (value !== undefined) {
+          res.setHeader(key, value);
+        }
+      }
+
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
+      upstreamRes.pipe(res);
+
+      upstreamRes.on('error', (err) => {
+        console.error('Upstream response error:', err);
+        if (!res.headersSent) {
+          writeJson(res, 502, { error: 'upstream_mcp_unavailable' });
+        } else {
+          try {
+            res.end();
+          } catch {}
+        }
+      });
+
+      upstreamRes.on('end', () => {
+        try {
+          res.end();
+        } catch {}
+      });
+    }
+  );
+
+  upstreamReq.on('error', (err) => {
+    console.error('Upstream request error:', err);
+    if (!res.headersSent) {
+      writeJson(res, 502, {
+        error: 'upstream_mcp_unavailable',
+        details: String(err?.message || err),
+      });
+    } else {
+      try {
+        res.end();
+      } catch {}
+    }
+  });
+
+  // Important for long-lived GET /mcp streams:
+  // if client disconnects, tear down upstream too, so MCP doesn't keep stale stream state.
+  req.on('aborted', () => {
+    try {
+      upstreamReq.destroy();
+    } catch {}
+  });
+
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      try {
+        upstreamReq.destroy();
+      } catch {}
+    }
+  });
+
+  if (rawBody) {
+    upstreamReq.end(rawBody);
+  } else {
+    req.pipe(upstreamReq);
+  }
+}
+
+app.get('/healthz', (_req, res) => {
+  const status = !mcpExited && mcpReady ? 200 : 503;
+  res.status(status).json({
+    ok: status === 200,
+    mcpReady,
+    mcpExited,
+  });
+});
+
+app.use((req, res, next) => {
+  if (req.path === '/healthz') return next();
+
+  if (!authorized(req)) {
+    return writeJson(res, 401, { error: 'unauthorized' });
+  }
+
+  return next();
+});
+
+// MCP prompt compatibility shim for POST /mcp only.
+// Non-shimmed requests are proxied raw to preserve streamable HTTP semantics.
+app.post('/mcp', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
   try {
-    const rawBodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
-    req.rawBody = rawBodyBuffer;
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
 
     let parsed;
     try {
-      parsed = JSON.parse(rawBodyBuffer.toString('utf8'));
+      parsed = JSON.parse(rawBody.toString('utf8'));
     } catch {
-      return proxy.web(req, res, { target: MCP_BASE_URL });
+      return proxyHttpToMcp(req, res, rawBody);
     }
 
-    // Single JSON-RPC request
     if (!Array.isArray(parsed)) {
       const shimmed = getShimmedResponse(parsed);
       if (shimmed) {
-        return res.status(200).json(shimmed);
+        return writeJson(res, 200, shimmed);
       }
 
-      return proxy.web(req, res, { target: MCP_BASE_URL });
+      return proxyHttpToMcp(req, res, rawBody);
     }
 
-    // Batch JSON-RPC request
     const shimmedResponses = parsed
       .map((item) => getShimmedResponse(item))
       .filter(Boolean);
 
-    // If the full batch is only shimmed prompt methods, respond directly
+    // Only answer directly if the whole batch is prompt-only shimmed methods.
     if (shimmedResponses.length === parsed.length) {
-      return res.status(200).json(shimmedResponses);
+      return writeJson(res, 200, shimmedResponses);
     }
 
-    // Otherwise, pass through unchanged to preserve MCP streaming behavior
-    return proxy.web(req, res, { target: MCP_BASE_URL });
+    // Mixed or non-shimmed batch: pass through unchanged.
+    return proxyHttpToMcp(req, res, rawBody);
   } catch (err) {
-    console.error('Shim POST /mcp error:', err);
-    return res.status(502).json({
+    console.error('POST /mcp shim error:', err);
+    return writeJson(res, 502, {
       error: 'mcp_proxy_failure',
       details: String(err?.message || err),
     });
   }
 });
 
-// Everything else proxies normally
+// All other /mcp traffic, including long-lived GET stream, is proxied raw.
+app.all('/mcp', (req, res) => {
+  proxyHttpToMcp(req, res);
+});
+
+// Any other HTTP path also proxies through.
 app.use((req, res) => {
-  proxy.web(req, res, { target: MCP_BASE_URL });
+  proxyHttpToMcp(req, res);
 });
 
 const server = app.listen(PUBLIC_PORT, '0.0.0.0', () => {
@@ -265,7 +376,6 @@ server.requestTimeout = 0;
 server.keepAliveTimeout = 75_000;
 server.timeout = 0;
 
-// WebSocket upgrade support
 server.on('upgrade', (req, socket, head) => {
   if (!authorized(req)) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -273,5 +383,5 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  proxy.ws(req, socket, head, { target: MCP_BASE_URL });
+  wsProxy.ws(req, socket, head, { target: MCP_BASE_URL });
 });
