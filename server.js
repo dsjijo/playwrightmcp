@@ -139,6 +139,181 @@ app.use((req, res, next) => {
   return next();
 });
 
+/**
+ * MCP prompt compatibility shim:
+ * Some clients/frameworks call prompts/list during startup.
+ * Playwright MCP may not implement it, so we fake an empty prompt list.
+ */
+const PROMPT_LIST_METHODS = new Set([
+  'prompts/list',
+  'list_prompts',
+]);
+
+const PROMPT_GET_METHODS = new Set([
+  'prompts/get',
+  'get_prompt',
+]);
+
+function buildJsonRpcSuccess(id, result) {
+  return {
+    jsonrpc: '2.0',
+    id,
+    result,
+  };
+}
+
+function buildJsonRpcError(id, code, message) {
+  return {
+    jsonrpc: '2.0',
+    id,
+    error: {
+      code,
+      message,
+    },
+  };
+}
+
+function getShimmedResponse(message) {
+  const method = message?.method;
+
+  if (PROMPT_LIST_METHODS.has(method)) {
+    return buildJsonRpcSuccess(message.id ?? null, {
+      prompts: [],
+    });
+  }
+
+  if (PROMPT_GET_METHODS.has(method)) {
+    // Usually not needed if prompts/list returns empty.
+    // But returning a clean error is safer than "method not found" from upstream.
+    return buildJsonRpcError(message.id ?? null, -32602, 'Prompt not found');
+  }
+
+  return null;
+}
+
+async function forwardPostToMcp(req, res, rawBodyBuffer) {
+  const headers = {};
+
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lower = key.toLowerCase();
+
+    // Do not forward proxy auth headers to local MCP
+    if (lower === 'host' || lower === 'content-length' || lower === 'authorization' || lower === 'x-api-key') {
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      headers[key] = value.join(', ');
+    } else if (value !== undefined) {
+      headers[key] = value;
+    }
+  }
+
+  const upstreamResponse = await fetch(`${MCP_BASE_URL}${req.originalUrl}`, {
+    method: 'POST',
+    headers,
+    body: rawBodyBuffer,
+  });
+
+  res.status(upstreamResponse.status);
+
+  upstreamResponse.headers.forEach((value, key) => {
+    if (key.toLowerCase() === 'transfer-encoding') return;
+    res.setHeader(key, value);
+  });
+
+  const responseBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
+  res.send(responseBuffer);
+}
+
+// Intercept POST /mcp only
+app.post('/mcp', express.raw({ type: '*/*', limit: '5mb' }), async (req, res) => {
+  try {
+    const rawBodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(rawBodyBuffer.toString('utf8'));
+    } catch {
+      // Not JSON -> just forward as-is
+      return await forwardPostToMcp(req, res, rawBodyBuffer);
+    }
+
+    // Handle single JSON-RPC request
+    if (!Array.isArray(parsed)) {
+      const shimmed = getShimmedResponse(parsed);
+      if (shimmed) {
+        return res.status(200).json(shimmed);
+      }
+
+      return await forwardPostToMcp(req, res, rawBodyBuffer);
+    }
+
+    // Handle batch JSON-RPC request
+    const shimmedResponses = [];
+    const forwardItems = [];
+
+    for (const item of parsed) {
+      const shimmed = getShimmedResponse(item);
+      if (shimmed) {
+        shimmedResponses.push(shimmed);
+      } else {
+        forwardItems.push(item);
+      }
+    }
+
+    if (forwardItems.length === 0) {
+      return res.status(200).json(shimmedResponses);
+    }
+
+    // If mixed batch, forward the non-shimmed items and merge results
+    const headers = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      const lower = key.toLowerCase();
+      if (lower === 'host' || lower === 'content-length' || lower === 'authorization' || lower === 'x-api-key') {
+        continue;
+      }
+
+      if (Array.isArray(value)) {
+        headers[key] = value.join(', ');
+      } else if (value !== undefined) {
+        headers[key] = value;
+      }
+    }
+
+    const upstreamResponse = await fetch(`${MCP_BASE_URL}${req.originalUrl}`, {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'content-type': 'application/json',
+      },
+      body: Buffer.from(JSON.stringify(forwardItems)),
+    });
+
+    const upstreamText = await upstreamResponse.text();
+    let upstreamJson = [];
+
+    try {
+      upstreamJson = JSON.parse(upstreamText);
+    } catch {
+      upstreamJson = [];
+    }
+
+    const combined = Array.isArray(upstreamJson)
+      ? [...upstreamJson, ...shimmedResponses]
+      : [upstreamJson, ...shimmedResponses];
+
+    return res.status(upstreamResponse.status).json(combined);
+  } catch (err) {
+    console.error('Shim POST /mcp error:', err);
+    return res.status(502).json({
+      error: 'mcp_proxy_failure',
+      details: String(err?.message || err),
+    });
+  }
+});
+
+// Everything else proxies normally (GET /mcp, DELETE /mcp, websocket, etc.)
 app.use((req, res) => {
   proxy.web(req, res, { target: MCP_BASE_URL });
 });
