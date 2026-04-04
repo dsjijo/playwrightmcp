@@ -26,7 +26,7 @@ let mcpExited = false;
 
 /**
  * WS proxy only.
- * HTTP proxying is handled manually below to preserve streamable HTTP behavior.
+ * HTTP proxying is handled manually below to better preserve streamable HTTP behavior.
  */
 const wsProxy = httpProxy.createProxyServer({
   target: MCP_BASE_URL,
@@ -216,6 +216,9 @@ function getShimmedResponse(message) {
 function proxyHttpToMcp(req, res, rawBody = null) {
   const headers = copyUpstreamHeaders(req, rawBody ? rawBody.length : null);
 
+  // Avoid compressed streaming; easier to keep alive
+  headers['accept-encoding'] = 'identity';
+
   const upstreamReq = http.request(
     {
       hostname: MCP_HOST,
@@ -225,22 +228,99 @@ function proxyHttpToMcp(req, res, rawBody = null) {
       headers,
     },
     (upstreamRes) => {
+      const contentType = String(upstreamRes.headers['content-type'] || '');
+      const isEventStream =
+        req.method === 'GET' &&
+        String(req.originalUrl || req.url || '').startsWith('/mcp') &&
+        contentType.includes('text/event-stream');
+
       res.status(upstreamRes.statusCode || 502);
 
       for (const [key, value] of Object.entries(upstreamRes.headers)) {
-        if (key.toLowerCase() === 'connection') continue;
+        const lower = key.toLowerCase();
+
+        // Manage these ourselves for streaming safety
+        if (lower === 'connection') continue;
+        if (isEventStream && lower === 'content-length') continue;
+
         if (value !== undefined) {
           res.setHeader(key, value);
         }
+      }
+
+      if (isEventStream) {
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+      }
+
+      if (req.socket) {
+        req.socket.setKeepAlive(true, 10000);
+        req.socket.setNoDelay(true);
+      }
+
+      if (res.socket) {
+        res.socket.setKeepAlive(true, 10000);
+        res.socket.setNoDelay(true);
       }
 
       if (typeof res.flushHeaders === 'function') {
         res.flushHeaders();
       }
 
-      upstreamRes.pipe(res);
+      let heartbeat = null;
+
+      const stopHeartbeat = () => {
+        if (heartbeat) {
+          clearInterval(heartbeat);
+          heartbeat = null;
+        }
+      };
+
+      if (isEventStream) {
+        // Initial harmless SSE comment
+        try {
+          res.write(': connected\n\n');
+        } catch {}
+
+        // Keep downstream GET stream alive
+        heartbeat = setInterval(() => {
+          if (!res.writableEnded && !res.destroyed) {
+            try {
+              res.write(': keepalive\n\n');
+            } catch {}
+          }
+        }, 2000);
+      }
+
+      if (isEventStream) {
+        upstreamRes.on('data', (chunk) => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(chunk);
+          }
+        });
+
+        upstreamRes.on('end', () => {
+          stopHeartbeat();
+          if (!res.writableEnded) {
+            res.end();
+          }
+        });
+
+        upstreamRes.on('close', () => {
+          stopHeartbeat();
+          if (!res.writableEnded) {
+            res.end();
+          }
+        });
+      } else {
+        upstreamRes.pipe(res);
+        upstreamRes.on('end', stopHeartbeat);
+        upstreamRes.on('close', stopHeartbeat);
+      }
 
       upstreamRes.on('error', (err) => {
+        stopHeartbeat();
         console.error('Upstream response error:', err);
         if (!res.headersSent) {
           writeJson(res, 502, { error: 'upstream_mcp_unavailable' });
@@ -250,14 +330,10 @@ function proxyHttpToMcp(req, res, rawBody = null) {
           } catch {}
         }
       });
-
-      upstreamRes.on('end', () => {
-        try {
-          res.end();
-        } catch {}
-      });
     }
   );
+
+  upstreamReq.setTimeout(0);
 
   upstreamReq.on('error', (err) => {
     console.error('Upstream request error:', err);
@@ -273,19 +349,22 @@ function proxyHttpToMcp(req, res, rawBody = null) {
     }
   });
 
-  // Important for long-lived GET /mcp streams:
-  // if client disconnects, tear down upstream too, so MCP doesn't keep stale stream state.
-  req.on('aborted', () => {
+  const teardown = () => {
     try {
       upstreamReq.destroy();
     } catch {}
+  };
+
+  req.on('aborted', teardown);
+  req.on('close', () => {
+    if (!req.complete) {
+      teardown();
+    }
   });
 
   res.on('close', () => {
     if (!res.writableEnded) {
-      try {
-        upstreamReq.destroy();
-      } catch {}
+      teardown();
     }
   });
 
@@ -315,8 +394,8 @@ app.use((req, res, next) => {
   return next();
 });
 
-// MCP prompt compatibility shim for POST /mcp only.
-// Non-shimmed requests are proxied raw to preserve streamable HTTP semantics.
+// Prompt compatibility shim for POST /mcp only.
+// Non-shimmed requests pass through unchanged.
 app.post('/mcp', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
   try {
     const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
@@ -341,12 +420,11 @@ app.post('/mcp', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
       .map((item) => getShimmedResponse(item))
       .filter(Boolean);
 
-    // Only answer directly if the whole batch is prompt-only shimmed methods.
+    // Only directly answer if all items are prompt shim methods
     if (shimmedResponses.length === parsed.length) {
       return writeJson(res, 200, shimmedResponses);
     }
 
-    // Mixed or non-shimmed batch: pass through unchanged.
     return proxyHttpToMcp(req, res, rawBody);
   } catch (err) {
     console.error('POST /mcp shim error:', err);
@@ -357,12 +435,12 @@ app.post('/mcp', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
   }
 });
 
-// All other /mcp traffic, including long-lived GET stream, is proxied raw.
+// All other /mcp traffic, including long-lived GET stream
 app.all('/mcp', (req, res) => {
   proxyHttpToMcp(req, res);
 });
 
-// Any other HTTP path also proxies through.
+// Any other HTTP path also proxies through
 app.use((req, res) => {
   proxyHttpToMcp(req, res);
 });
